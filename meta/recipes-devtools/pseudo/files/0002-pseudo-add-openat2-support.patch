@@ -1,0 +1,240 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Wei Gao <leou85@gmail.com>
+Date: Mon, 27 Oct 2026 12:00:00 +0000
+Subject: [PATCH] pseudo: Add openat2 support to fix GNU tar 1.35 builds
+
+Upstream-Status: Backport [fray/openat2 branch: be14bb7 0c330bd 472c897]
+
+GNU tar 1.35 uses the openat2() syscall (Linux 5.6+) with RESOLVE_BENEATH
+for secure directory traversal during archive extraction. Without pseudo
+intercepting this syscall, directory file descriptors are not tracked and
+subsequent *at() calls fail with "unknown directory" errors causing tar to
+crash or return EFAULT.
+
+This patch adds:
+1. Infrastructure for the openat2 subport (makewrappers, subports)
+2. Full openat2() wrapper that tracks fds in pseudo's database
+3. Block openat2 when called via syscall() to prevent bypass
+
+Based on commits from the pseudo fray/openat2 branch:
+- be14bb7 ports/linux/openat2: Add dummy wrapper
+- 0c330bd openat2: Implement openat2 wrapper
+- 472c897 ports/linux/pseudo_wrappers: Avoid openat2 usage via syscall
+
+Signed-off-by: Wei Gao <leou85@gmail.com>
+diff --git a/makewrappers b/makewrappers
+index 1f7ddce..38e9194 100755
+--- a/makewrappers
++++ b/makewrappers
+@@ -200,6 +200,7 @@ typedata = {
+   'ssize_t': { 'format': '%ld', 'value': '(long) rc' },
+   'struct group *': { 'format': '%p', 'value': '(void *) rc' },
+   'struct passwd *': { 'format': '%p', 'value': '(void *) rc' },
++  'struct open_how *': { 'format': '%p', 'value': '(void *) rc' },
+   'uid_t': { 'format': '%ld', 'value': ' (long) rc' },
+   'void *': { 'format': '%p', 'value': 'rc' },
+   'void': { 'format': 'void%s', 'value': '""' },
+diff --git a/ports/linux/subports b/ports/linux/subports
+index 099ea59..b202c27 100755
+--- a/ports/linux/subports
++++ b/ports/linux/subports
+@@ -70,3 +70,5 @@ else
+ fi
+ rm -f dummy.c dummy.o
+ 
++# For openat2, similar to statx, we need to be able to build on systems without that support.
++echo "linux/openat2"
+diff --git a/ports/linux/pseudo_wrappers.c b/ports/linux/pseudo_wrappers.c
+index 7659897..bc5db21 100644
+--- a/ports/linux/pseudo_wrappers.c
++++ b/ports/linux/pseudo_wrappers.c
+@@ -92,6 +92,19 @@ syscall(long number, ...) {
+ 	}
+ #endif
+ 
++#ifdef SYS_openat2
++	/* concerns exist about trying to parse arguments because syscall(2)
++	 * specifies strange ABI behaviors. If we can get better clarity on
++	 * that, it could make sense to redirect to wrap_openat2().
++	 * There is a CVE patch (CVE-2025-45582) to tar 1.34 in Centos Stream which
++	 * uses syscall to access openat2() and breaks builds if we don't redirect.
++	 */
++	if (number == SYS_openat2) {
++		errno = ENOSYS;
++		return -1;
++	}
++#endif
++
+ 	/* gcc magic to attempt to just pass these args to syscall. we have to
+ 	 * guess about the number of args; the docs discuss calling conventions
+ 	 * up to 7, so let's try that?
+--- /dev/null	2026-10-27 02:46:47.000999756 +0000
++++ ports/linux/openat2/portdefs.h	2026-10-27 11:26:14.052873186 +0000
+@@ -0,0 +1,13 @@
++/*
++ * SPDX-License-Identifier: LGPL-2.1-only
++ *
++ */
++#if __has_include (<linux/openat2.h>)
++# include <linux/openat2.h>
++#else
++  struct open_how {
++        __u64 flags;
++        __u64 mode;
++        __u64 resolve;
++  };
++#endif
+diff --git a/ports/linux/openat2/wrapfuncs.in b/ports/linux/openat2/wrapfuncs.in
+new file mode 100644
+index 0000000..96ae8a7
+--- /dev/null
++++ b/ports/linux/openat2/wrapfuncs.in
+@@ -0,0 +1 @@
++int openat2(int dirfd, const char *path, struct open_how *how, size_t size);
+diff --git a/ports/linux/openat2/portdefs.h b/ports/linux/openat2/portdefs.h
+new file mode 100644
+index 0000000..8e4e33e
+--- /dev/null
++++ b/ports/linux/openat2/portdefs.h
+@@ -0,0 +1,13 @@
++/*
++ * SPDX-License-Identifier: LGPL-2.1-only
++ *
++ */
++#if __has_include (<linux/openat2.h>)
++# include <linux/openat2.h>
++#else
++  struct open_how {
++        __u64 flags;
++        __u64 mode;
++        __u64 resolve;
++  };
++#endif
+diff --git a/ports/linux/openat2/guts/openat2.c b/ports/linux/openat2/guts/openat2.c
+new file mode 100644
+index 0000000..e7f25da
+--- /dev/null
++++ b/ports/linux/openat2/guts/openat2.c
+@@ -0,0 +1,122 @@
++/* 
++ * Copyright (c) 2008-2010, 2013 Wind River Systems
++ * Copyright (c) 2026 Yocto Project
++ * see guts/COPYRIGHT for information.
++ *
++ * SPDX-License-Identifier: LGPL-2.1-only
++ *
++ * Note this file is based on ./ports/linux/guts/openat.c
++ *
++ * int openat2(int dirfd, const char *path, struct open_how *how, size_t size)
++ *	int rc = -1;
++ */
++	struct stat64 buf;
++	int overly_magic_nonblocking = 0;
++	int existed = 1;
++	int save_errno;
++	sigset_t local_saved_sigmask;
++	struct open_how my_how;
++
++	/* Validate parameters */
++	if (!how || size < sizeof(struct open_how)) {
++		errno = EINVAL;
++		return -1;
++	}
++	if (size > sizeof(struct open_how)) {
++		errno = E2BIG;
++		return -1;
++	}
++
++	memcpy(&my_how, how, size);
++
++	/* mask out mode bits appropriately */
++	my_how.mode = my_how.mode & ~pseudo_umask;
++
++#if defined(PSEUDO_NO_REAL_AT_FUNCTIONS) || ! defined(SYS_openat2)
++	if (dirfd != AT_FDCWD) {
++		errno = ENOSYS;
++		return -1;
++	}
++#endif
++
++	/* if a creation has been requested, check whether file exists */
++	if (my_how.flags & O_CREAT) {
++		save_errno = errno;
++		rc = real___fxstatat64(_STAT_VER, dirfd, path, &buf, (my_how.flags & O_NOFOLLOW) ? AT_SYMLINK_NOFOLLOW : 0);
++		existed = (rc != -1);
++		if (!existed)
++			pseudo_debug(PDBGF_FILE, "openat2_creat: %s -> 0%llo\n", path, (long long) my_how.mode);
++		errno = save_errno;
++	}
++
++	/* if a pipe is opened without O_NONBLOCK, for only reading or
++	 * only writing, it can block forever. We need to do extra magic
++	 * in that case...
++	 */
++	if (!(my_how.flags & O_NONBLOCK) && ((my_how.flags & (O_WRONLY | O_RDONLY | O_RDWR)) != O_RDWR)) {
++		save_errno = errno;
++		rc = real___fxstatat64(_STAT_VER, dirfd, path, &buf, (my_how.flags & O_NOFOLLOW) ? AT_SYMLINK_NOFOLLOW : 0);
++		if (rc != -1 && S_ISFIFO(buf.st_mode)) {
++			overly_magic_nonblocking = 1;
++		}
++	}
++
++	if (overly_magic_nonblocking) {
++		pseudo_droplock();
++		sigprocmask(SIG_SETMASK, &pseudo_saved_sigmask, &local_saved_sigmask);
++	}
++
++	/* because we are not actually root, secretly mask in 0600 to the
++	 * underlying mode.  The ", 0" is because the only time mode matters
++	 * is if a file is going to be created, in which case it's
++	 * not a directory.
++	 */
++#if defined(SYS_openat2)
++	my_how.mode = PSEUDO_FS_MODE(my_how.mode, 0);
++	rc = syscall(SYS_openat2, dirfd, path, &my_how, sizeof(my_how));
++#else
++	rc = real_openat(dirfd, path, my_how.flags, PSEUDO_FS_MODE(my_how.mode, 0));
++#endif
++	if (overly_magic_nonblocking) {
++		save_errno = errno;
++		sigprocmask(SIG_SETMASK, &local_saved_sigmask, NULL);
++		if (pseudo_getlock()) {
++			pseudo_diag("PANIC: after opening a readonly/writeonly FIFO (path '%s', fd %d, errno %d, saved errno %d), could not regain lock. unrecoverable. sorry. bye.\n",
++				path, rc, errno, save_errno);
++			abort();
++		}
++		errno = save_errno;
++	}
++
++	if (rc != -1) {
++		save_errno = errno;
++		int stat_rc;
++#ifdef O_TMPFILE
++		if ((my_how.flags & O_TMPFILE) == O_TMPFILE) {
++			real_fchmod(rc, PSEUDO_FS_MODE(my_how.mode, 0));
++			errno = save_errno;
++			return rc;
++		}
++#endif
++		stat_rc = real___fxstatat64(_STAT_VER, dirfd, path, &buf, (my_how.flags & O_NOFOLLOW) ? AT_SYMLINK_NOFOLLOW : 0);
++
++		pseudo_debug(PDBGF_FILE, "openat2(path %s), flags %llo, stat rc %d, stat mode %o\n",
++			path, (long long) my_how.flags, stat_rc, buf.st_mode);
++		if (stat_rc != -1) {
++			buf.st_mode = PSEUDO_DB_MODE(buf.st_mode, my_how.mode);
++			if (!existed) {
++				real_fchmod(rc, PSEUDO_FS_MODE(my_how.mode, 0));
++				pseudo_client_op(OP_CREAT, 0, -1, dirfd, path, &buf);
++			}
++			pseudo_client_op(OP_OPEN, PSEUDO_ACCESS(my_how.flags), rc, dirfd, path, &buf);
++		} else {
++			pseudo_debug(PDBGF_FILE, "openat2 (fd %d, path %d/%s, flags %lld) succeeded, but stat failed (%s).\n",
++				rc, dirfd, path, (long long) my_how.flags, strerror(errno));
++			pseudo_client_op(OP_OPEN, PSEUDO_ACCESS(my_how.flags), rc, dirfd, path, 0);
++		}
++		errno = save_errno;
++	}
++
++/*	return rc;
++ * }
++ */
